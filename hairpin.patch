@@ -1,0 +1,1474 @@
+From efa0a5a4cbd179389cdbf34982bbb592dd3094a6 Mon Sep 17 00:00:00 2001
+From: Zili Meng <zilim@ieee.org>
+Date: Tue, 9 Apr 2024 14:26:00 +0800
+Subject: [PATCH 1/1] Hairpin WebRTC patch
+
+* redirect log to file
+
+* add rtx fec generator
+
+* change fec method
+
+* add rtx impl
+
+* add rtx reference without capture time
+
+* add rtx fec
+
+* add bandwidth cost and deadline miss rate statistics
+
+* change the calculate method of deadline miss rate
+
+* add sortable vector for rtx fec
+
+* add hairpin fec rate table
+
+* hairpin fix performance in stable bitrate
+
+* hairpin version3+
+
+* add dup packets for fec rate > 1 and refactor rtx_media_packets_ container
+
+---------
+
+Co-authored-by: Yan Zhang <zyan20@mails.tsianghua.edu.cn>
+---
+ call/rtp_video_sender.cc                      |  17 +-
+ call/rtp_video_sender.h                       |   4 +-
+ media/engine/webrtc_video_engine.cc           |   1 +
+ modules/include/module_fec_types.h            |   2 +
+ modules/rtp_rtcp/include/flexfec_sender.h     |   5 +
+ .../source/flexfec_receiver_unittest.cc       |   2 +-
+ .../source/forward_error_correction.cc        |  18 +-
+ .../source/forward_error_correction.h         |   3 +-
+ modules/rtp_rtcp/source/rtp_fec_unittest.cc   |  36 +-
+ modules/rtp_rtcp/source/rtp_packet_history.cc |   6 +-
+ modules/rtp_rtcp/source/rtp_packet_history.h  |   2 +
+ modules/rtp_rtcp/source/rtp_rtcp_interface.h  |   1 +
+ modules/rtp_rtcp/source/rtp_sender.cc         |  90 ++++-
+ modules/rtp_rtcp/source/rtp_sender.h          |  12 +
+ modules/rtp_rtcp/source/rtp_sender_egress.cc  |   3 +
+ modules/rtp_rtcp/source/rtp_sender_egress.h   |   1 +
+ modules/rtp_rtcp/source/ulpfec_generator.cc   | 341 +++++++++++++++++-
+ modules/rtp_rtcp/source/ulpfec_generator.h    |  55 ++-
+ modules/rtp_rtcp/source/ulpfec_receiver.cc    |   2 +-
+ .../source/ulpfec_receiver_unittest.cc        |   4 +-
+ modules/rtp_rtcp/source/video_fec_generator.h |   5 +
+ modules/rtp_rtcp/test/testFec/test_fec.cc     |   2 +-
+ .../video_coding/fec_controller_default.cc    |   4 +
+ modules/video_coding/nack_requester.h         |   2 +-
+ modules/video_coding/timing/timing.cc         |  12 +
+ modules/video_coding/timing/timing.h          |   3 +
+ rtc_base/bitrate_tracker.cc                   |   4 +
+ rtc_base/bitrate_tracker.h                    |   2 +
+ rtc_base/rate_statistics.cc                   |   8 +
+ rtc_base/rate_statistics.h                    |   4 +
+ video/rtp_video_stream_receiver2.cc           |   4 +-
+ 31 files changed, 609 insertions(+), 46 deletions(-)
+
+diff --git a/call/rtp_video_sender.cc b/call/rtp_video_sender.cc
+index c7907a0224..65d7ad6fec 100644
+--- a/call/rtp_video_sender.cc
++++ b/call/rtp_video_sender.cc
+@@ -41,10 +41,12 @@ namespace webrtc_internal_rtp_video_sender {
+ RtpStreamSender::RtpStreamSender(
+     std::unique_ptr<ModuleRtpRtcpImpl2> rtp_rtcp,
+     std::unique_ptr<RTPSenderVideo> sender_video,
+-    std::unique_ptr<VideoFecGenerator> fec_generator)
++    std::unique_ptr<VideoFecGenerator> fec_generator,
++    std::unique_ptr<VideoFecGenerator> rtx_fec_generator)
+     : rtp_rtcp(std::move(rtp_rtcp)),
+       sender_video(std::move(sender_video)),
+-      fec_generator(std::move(fec_generator)) {}
++      fec_generator(std::move(fec_generator)),
++      rtx_fec_generator(std::move(rtx_fec_generator)) {}
+ 
+ RtpStreamSender::~RtpStreamSender() = default;
+ 
+@@ -222,7 +224,7 @@ std::vector<RtpStreamSender> CreateRtpStreamSenders(
+       observers.rtcp_type_observer;
+   configuration.report_block_data_observer =
+       observers.report_block_data_observer;
+-  configuration.paced_sender = transport->packet_sender();
++  configuration.paced_sender = nullptr;
+   configuration.send_bitrate_observer = observers.bitrate_observer;
+   configuration.send_packet_observer = observers.send_packet_observer;
+   configuration.event_log = event_log;
+@@ -254,6 +256,9 @@ std::vector<RtpStreamSender> CreateRtpStreamSenders(
+     std::unique_ptr<VideoFecGenerator> fec_generator =
+         MaybeCreateFecGenerator(clock, rtp_config, suspended_ssrcs, i, trials);
+     configuration.fec_generator = fec_generator.get();
++    std::unique_ptr<VideoFecGenerator> rtx_fec_generator =
++        MaybeCreateFecGenerator(clock, rtp_config, suspended_ssrcs, i, trials);
++    configuration.rtx_fec_generator = rtx_fec_generator.get();
+ 
+     configuration.rtx_send_ssrc =
+         rtp_config.GetRtxSsrcAssociatedWithMediaSsrc(rtp_config.ssrcs[i]);
+@@ -299,7 +304,7 @@ std::vector<RtpStreamSender> CreateRtpStreamSenders(
+     video_config.task_queue_factory = task_queue_factory;
+     auto sender_video = std::make_unique<RTPSenderVideo>(video_config);
+     rtp_streams.emplace_back(std::move(rtp_rtcp), std::move(sender_video),
+-                             std::move(fec_generator));
++                             std::move(fec_generator), std::move(rtx_fec_generator));
+   }
+   return rtp_streams;
+ }
+@@ -575,9 +580,7 @@ EncodedImageCallback::Result RtpVideoSender::OnEncodedImage(
+   RTC_DCHECK_LT(simulcast_index, rtp_streams_.size());
+ 
+   uint32_t rtp_timestamp =
+-      encoded_image.RtpTimestamp() +
+-      rtp_streams_[simulcast_index].rtp_rtcp->StartTimestamp();
+-
++      encoded_image.RtpTimestamp();      
+   // RTCPSender has it's own copy of the timestamp offset, added in
+   // RTCPSender::BuildSR, hence we must not add the in the offset for this call.
+   // TODO(nisse): Delete RTCPSender:timestamp_offset_, and see if we can confine
+diff --git a/call/rtp_video_sender.h b/call/rtp_video_sender.h
+index 10b0d19d05..2611bb8576 100644
+--- a/call/rtp_video_sender.h
++++ b/call/rtp_video_sender.h
+@@ -52,7 +52,8 @@ namespace webrtc_internal_rtp_video_sender {
+ struct RtpStreamSender {
+   RtpStreamSender(std::unique_ptr<ModuleRtpRtcpImpl2> rtp_rtcp,
+                   std::unique_ptr<RTPSenderVideo> sender_video,
+-                  std::unique_ptr<VideoFecGenerator> fec_generator);
++                  std::unique_ptr<VideoFecGenerator> fec_generator,
++                  std::unique_ptr<VideoFecGenerator> rtx_fec_generator);
+   ~RtpStreamSender();
+ 
+   RtpStreamSender(RtpStreamSender&&) = default;
+@@ -62,6 +63,7 @@ struct RtpStreamSender {
+   std::unique_ptr<ModuleRtpRtcpImpl2> rtp_rtcp;
+   std::unique_ptr<RTPSenderVideo> sender_video;
+   std::unique_ptr<VideoFecGenerator> fec_generator;
++  std::unique_ptr<VideoFecGenerator> rtx_fec_generator;
+ };
+ 
+ }  // namespace webrtc_internal_rtp_video_sender
+diff --git a/media/engine/webrtc_video_engine.cc b/media/engine/webrtc_video_engine.cc
+index 91750b837b..7207606918 100644
+--- a/media/engine/webrtc_video_engine.cc
++++ b/media/engine/webrtc_video_engine.cc
+@@ -119,6 +119,7 @@ void AddDefaultFeedbackParams(VideoCodec* codec,
+   codec->AddFeedbackParam(FeedbackParam(kRtcpFbParamRemb, kParamValueEmpty));
+   codec->AddFeedbackParam(
+       FeedbackParam(kRtcpFbParamTransportCc, kParamValueEmpty));
++  codec->AddFeedbackParam(FeedbackParam(kRtcpFbParamRrtr, kParamValueEmpty));
+   // Don't add any more feedback params for FLEXFEC.
+   if (codec->name == kFlexfecCodecName)
+     return;
+diff --git a/modules/include/module_fec_types.h b/modules/include/module_fec_types.h
+index fa35342764..8b909d6309 100644
+--- a/modules/include/module_fec_types.h
++++ b/modules/include/module_fec_types.h
+@@ -26,6 +26,8 @@ enum FecMaskType {
+ struct FecProtectionParams {
+   int fec_rate = 0;
+   int max_fec_frames = 0;
++  int loss = 0;
++  int rtt_ms = 0;
+   FecMaskType fec_mask_type = FecMaskType::kFecMaskRandom;
+ };
+ 
+diff --git a/modules/rtp_rtcp/include/flexfec_sender.h b/modules/rtp_rtcp/include/flexfec_sender.h
+index 8f21ab7517..5b0df85d06 100644
+--- a/modules/rtp_rtcp/include/flexfec_sender.h
++++ b/modules/rtp_rtcp/include/flexfec_sender.h
+@@ -62,9 +62,14 @@ class FlexfecSender : public VideoFecGenerator {
+   // have been added, the FEC packets are generated and stored internally.
+   // These FEC packets are then obtained by calling GetFecPackets().
+   void AddPacketAndGenerateFec(const RtpPacketToSend& packet) override;
++  int RtxAddPacketAndGenerateFec(const RtpPacketToSend& packet) override {return 0;}
++  std::vector<std::unique_ptr<RtpPacketToSend>> GetRtxFecPackets(int fec_seq_num) override {return std::vector<std::unique_ptr<RtpPacketToSend>>();}
++  int ProcessPeriodicTask() override {return 0;}
++
+ 
+   // Returns generated FlexFEC packets.
+   std::vector<std::unique_ptr<RtpPacketToSend>> GetFecPackets() override;
++  std::vector<std::unique_ptr<RtpPacketToSend>> GetDupPackets() override {return std::vector<std::unique_ptr<RtpPacketToSend>>();}
+ 
+   // Returns the overhead, per packet, for FlexFEC.
+   size_t MaxPacketOverhead() const override;
+diff --git a/modules/rtp_rtcp/source/flexfec_receiver_unittest.cc b/modules/rtp_rtcp/source/flexfec_receiver_unittest.cc
+index 1243858b6b..5e94dec972 100644
+--- a/modules/rtp_rtcp/source/flexfec_receiver_unittest.cc
++++ b/modules/rtp_rtcp/source/flexfec_receiver_unittest.cc
+@@ -104,7 +104,7 @@ std::list<Packet*> FlexfecReceiverTest::EncodeFec(
+   std::list<Packet*> fec_packets;
+   EXPECT_EQ(0, erasure_code_->EncodeFec(
+                    media_packets, protection_factor, kNumImportantPackets,
+-                   kUseUnequalProtection, kFecMaskType, &fec_packets));
++                   kUseUnequalProtection, kFecMaskType, &fec_packets, -1));
+   EXPECT_EQ(num_fec_packets, fec_packets.size());
+   return fec_packets;
+ }
+diff --git a/modules/rtp_rtcp/source/forward_error_correction.cc b/modules/rtp_rtcp/source/forward_error_correction.cc
+index 15a0801ac0..fe462c9f89 100644
+--- a/modules/rtp_rtcp/source/forward_error_correction.cc
++++ b/modules/rtp_rtcp/source/forward_error_correction.cc
+@@ -113,14 +113,15 @@ int ForwardErrorCorrection::EncodeFec(const PacketList& media_packets,
+                                       int num_important_packets,
+                                       bool use_unequal_protection,
+                                       FecMaskType fec_mask_type,
+-                                      std::list<Packet*>* fec_packets) {
++                                      std::list<Packet*>* fec_packets,
++                                      int fec_cnt) {
+   const size_t num_media_packets = media_packets.size();
+ 
+   // Sanity check arguments.
+   RTC_DCHECK_GT(num_media_packets, 0);
+   RTC_DCHECK_GE(num_important_packets, 0);
+   RTC_DCHECK_LE(num_important_packets, num_media_packets);
+-  RTC_DCHECK(fec_packets->empty());
++  // RTC_DCHECK(fec_packets->empty());
+   const size_t max_media_packets = fec_header_writer_->MaxMediaPackets();
+   if (num_media_packets > max_media_packets) {
+     RTC_LOG(LS_WARNING) << "Can't protect " << num_media_packets
+@@ -148,8 +149,15 @@ int ForwardErrorCorrection::EncodeFec(const PacketList& media_packets,
+     }
+   }
+ 
++  int num_fec_packets;
++
++  if (fec_cnt != -1) {
++    num_fec_packets = fec_cnt;
++  } else {
++    num_fec_packets = NumFecPackets(num_media_packets, protection_factor);
++  }
++
+   // Prepare generated FEC packets.
+-  int num_fec_packets = NumFecPackets(num_media_packets, protection_factor);
+   if (num_fec_packets == 0) {
+     return 0;
+   }
+@@ -487,7 +495,7 @@ void ForwardErrorCorrection::AssignRecoveredPackets(
+     } else if (less_than(*it_r, *it_p)) {
+       ++it_r;
+     } else {  // *it_p == *it_r.
+-      // This protected packet has already been recovered.
++    // This protected packet has already been recovered.
+       (*it_p)->pkt = (*it_r)->pkt;
+       ++it_p;
+       ++it_r;
+@@ -673,7 +681,7 @@ size_t ForwardErrorCorrection::AttemptRecovery(
+   while (fec_packet_it != received_fec_packets_.end()) {
+     // Search for each FEC packet's protected media packets.
+     int packets_missing = NumCoveredPacketsMissing(**fec_packet_it);
+-
++    
+     // We can only recover one packet with an FEC packet.
+     if (packets_missing == 1) {
+       // Recovery possible.
+diff --git a/modules/rtp_rtcp/source/forward_error_correction.h b/modules/rtp_rtcp/source/forward_error_correction.h
+index 84278a8c5f..91fbcbfbab 100644
+--- a/modules/rtp_rtcp/source/forward_error_correction.h
++++ b/modules/rtp_rtcp/source/forward_error_correction.h
+@@ -205,7 +205,8 @@ class ForwardErrorCorrection {
+                 int num_important_packets,
+                 bool use_unequal_protection,
+                 FecMaskType fec_mask_type,
+-                std::list<Packet*>* fec_packets);
++                std::list<Packet*>* fec_packets,
++                int fec_cnt);
+ 
+   // Decodes a list of received media and FEC packets. It will parse the
+   // `received_packets`, storing FEC packets internally, and move
+diff --git a/modules/rtp_rtcp/source/rtp_fec_unittest.cc b/modules/rtp_rtcp/source/rtp_fec_unittest.cc
+index 7e5aef7634..dfdad9199d 100644
+--- a/modules/rtp_rtcp/source/rtp_fec_unittest.cc
++++ b/modules/rtp_rtcp/source/rtp_fec_unittest.cc
+@@ -230,7 +230,7 @@ TYPED_TEST(RtpFecTest, WillProtectMediaPacketsWithLargeSequenceNumberGap) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+ }
+ 
+@@ -254,7 +254,7 @@ TYPED_TEST(RtpFecTest,
+   EXPECT_EQ(
+       -1, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                                kNumImportantPackets, kUseUnequalProtection,
+-                               kFecMaskBursty, &this->generated_fec_packets_));
++                               kFecMaskBursty, &this->generated_fec_packets_, -1));
+   EXPECT_TRUE(this->generated_fec_packets_.empty());
+ }
+ 
+@@ -270,7 +270,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryNoLoss) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -300,7 +300,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithLoss) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -356,7 +356,7 @@ TYPED_TEST(RtpFecTest, NoFecRecoveryWithOldFecPacket) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+   // Add FEC packet (seq#2) of this first frame to received list (i.e., assume
+@@ -417,7 +417,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithSeqNumGapOneFrameRecovery) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -468,7 +468,7 @@ TEST_F(RtpFecTestUlpfecOnly, FecRecoveryWithSeqNumGapOneFrameRecovery) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 2 FEC packets.
+   EXPECT_EQ(2u, this->generated_fec_packets_.size());
+@@ -519,7 +519,7 @@ TEST_F(RtpFecTestFlexfecOnly, FecRecoveryWithSeqNumGapOneFrameNoRecovery) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 2 FEC packets.
+   EXPECT_EQ(2u, this->generated_fec_packets_.size());
+@@ -568,7 +568,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithMediaOutOfOrder) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -609,7 +609,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithFecOutOfOrder) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -658,7 +658,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithLoss50percRandomMask) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskRandom, &this->generated_fec_packets_));
++                              kFecMaskRandom, &this->generated_fec_packets_, -1));
+ 
+   // Expect 4 FEC packets.
+   EXPECT_EQ(4u, this->generated_fec_packets_.size());
+@@ -722,7 +722,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithLoss50percBurstyMask) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 4 FEC packets.
+   EXPECT_EQ(4u, this->generated_fec_packets_.size());
+@@ -790,7 +790,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryNoLossUep) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -820,7 +820,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithLossUep) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -877,7 +877,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryWithLoss50percUepRandomMask) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(this->media_packets_, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskRandom, &this->generated_fec_packets_));
++                              kFecMaskRandom, &this->generated_fec_packets_, -1));
+ 
+   // Expect 4 FEC packets.
+   EXPECT_EQ(4u, this->generated_fec_packets_.size());
+@@ -934,7 +934,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryNonConsecutivePackets) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(protected_media_packets, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 1 FEC packet.
+   EXPECT_EQ(1u, this->generated_fec_packets_.size());
+@@ -1002,7 +1002,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryNonConsecutivePacketsExtension) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(protected_media_packets, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 5 FEC packet.
+   EXPECT_EQ(5u, this->generated_fec_packets_.size());
+@@ -1074,7 +1074,7 @@ TYPED_TEST(RtpFecTest, FecRecoveryNonConsecutivePacketsWrap) {
+   EXPECT_EQ(
+       0, this->fec_.EncodeFec(protected_media_packets, kProtectionFactor,
+                               kNumImportantPackets, kUseUnequalProtection,
+-                              kFecMaskBursty, &this->generated_fec_packets_));
++                              kFecMaskBursty, &this->generated_fec_packets_, -1));
+ 
+   // Expect 5 FEC packet.
+   EXPECT_EQ(5u, this->generated_fec_packets_.size());
+diff --git a/modules/rtp_rtcp/source/rtp_packet_history.cc b/modules/rtp_rtcp/source/rtp_packet_history.cc
+index 1e75e4787e..2f52ceb8a8 100644
+--- a/modules/rtp_rtcp/source/rtp_packet_history.cc
++++ b/modules/rtp_rtcp/source/rtp_packet_history.cc
+@@ -114,6 +114,11 @@ void RtpPacketHistory::SetRtt(TimeDelta rtt) {
+   }
+ }
+ 
++TimeDelta RtpPacketHistory::GetRtt() {
++    MutexLock lock(&lock_);
++    return rtt_;
++}
++
+ void RtpPacketHistory::PutRtpPacket(std::unique_ptr<RtpPacketToSend> packet,
+                                     Timestamp send_time) {
+   RTC_DCHECK(packet);
+@@ -189,7 +194,6 @@ std::unique_ptr<RtpPacketToSend> RtpPacketHistory::GetPacketAndMarkAsPending(
+   if (mode_ == StorageMode::kDisabled) {
+     return nullptr;
+   }
+-
+   StoredPacket* packet = GetStoredPacket(sequence_number);
+   if (packet == nullptr) {
+     return nullptr;
+diff --git a/modules/rtp_rtcp/source/rtp_packet_history.h b/modules/rtp_rtcp/source/rtp_packet_history.h
+index 18310a8bd3..8ad7e7336c 100644
+--- a/modules/rtp_rtcp/source/rtp_packet_history.h
++++ b/modules/rtp_rtcp/source/rtp_packet_history.h
+@@ -79,6 +79,8 @@ class RtpPacketHistory {
+   // Set RTT, used to avoid premature retransmission and to prevent over-writing
+   // a packet in the history before we are reasonably sure it has been received.
+   void SetRtt(TimeDelta rtt);
++  TimeDelta GetRtt();
++
+ 
+   void PutRtpPacket(std::unique_ptr<RtpPacketToSend> packet,
+                     Timestamp send_time);
+diff --git a/modules/rtp_rtcp/source/rtp_rtcp_interface.h b/modules/rtp_rtcp/source/rtp_rtcp_interface.h
+index 924c764ccd..1b9b8c0296 100644
+--- a/modules/rtp_rtcp/source/rtp_rtcp_interface.h
++++ b/modules/rtp_rtcp/source/rtp_rtcp_interface.h
+@@ -93,6 +93,7 @@ class RtpRtcpInterface : public RtcpFeedbackSenderInterface {
+     // Generates FEC packets.
+     // TODO(sprang): Wire up to RtpSenderEgress.
+     VideoFecGenerator* fec_generator = nullptr;
++    VideoFecGenerator* rtx_fec_generator = nullptr;
+ 
+     BitrateStatisticsObserver* send_bitrate_observer = nullptr;
+     RtcEventLog* event_log = nullptr;
+diff --git a/modules/rtp_rtcp/source/rtp_sender.cc b/modules/rtp_rtcp/source/rtp_sender.cc
+index d899b4f44e..1a46ce900b 100644
+--- a/modules/rtp_rtcp/source/rtp_sender.cc
++++ b/modules/rtp_rtcp/source/rtp_sender.cc
+@@ -153,6 +153,7 @@ RTPSender::RTPSender(const RtpRtcpInterface::Configuration& config,
+                                          : absl::nullopt),
+       packet_history_(packet_history),
+       paced_sender_(packet_sender),
++      rtx_fec_generator_(config.rtx_fec_generator),
+       sending_media_(true),                   // Default to sending media.
+       max_packet_size_(IP_PACKET_SIZE - 28),  // Default is IP-v4/UDP.
+       rtp_header_extension_map_(config.extmap_allow_mixed),
+@@ -170,7 +171,7 @@ RTPSender::RTPSender(const RtpRtcpInterface::Configuration& config,
+   RTC_DCHECK(paced_sender_);
+   RTC_DCHECK(packet_history_);
+   RTC_DCHECK_LE(rid_.size(), RtpStreamId::kMaxValueSizeBytes);
+-
++  RegisterPeriodicModule();
+   UpdateHeaderSizes();
+ }
+ 
+@@ -266,10 +267,57 @@ void RTPSender::SetRtxPayloadType(int payload_type,
+   rtx_payload_type_map_[associated_payload_type] = payload_type;
+ }
+ 
++void RTPSender::RegisterPeriodicModule() {
++  repeating_task_ = RepeatingTaskHandle::DelayedStart(
++      TaskQueueBase::Current(), kUpdateInterval, [this] {
++        ProcessPeriodicTask();
++        return kUpdateInterval;
++      });
++}
++
++void RTPSender::ProcessPeriodicTask(){
++  std::vector<std::unique_ptr<RtpPacketToSend>> packets;  
++  auto fec_cnt = rtx_fec_generator_->ProcessPeriodicTask();
++  auto fec_packets = rtx_fec_generator_->GetRtxFecPackets(rtx_fec_base_num_ - wnd_rtx_fec_cnt_);
++  auto dup_packets = rtx_fec_generator_->GetDupPackets();
++  wnd_rtx_fec_cnt_ += fec_cnt;
++  for (int i = 0; i < (int)dup_packets.size(); i++) {
++    std::unique_ptr<RtpPacketToSend> rtx_dup_packet = BuildRtxPacket(*dup_packets[i]);
++    rtx_dup_packet->set_retransmitted_sequence_number((*dup_packets[i]).SequenceNumber());
++    rtx_dup_packet->set_packet_type(RtpPacketMediaType::kRetransmission);
++    rtx_dup_packet->set_fec_protect_packet(false);
++    RTC_LOG(LS_INFO) << "send dup pkt: " << (*dup_packets[i]).SequenceNumber();
++    packets.emplace_back(std::move(rtx_dup_packet));
++  }
++  for (int i = 0; i < (int)fec_packets.size(); i++) {
++    std::unique_ptr<RtpPacketToSend> rtx_fec_packet = BuildRtxPacket(*fec_packets[i]);
++    rtx_fec_packet->set_retransmitted_sequence_number((*fec_packets[i]).SequenceNumber());
++    rtx_fec_packet->set_packet_type(RtpPacketMediaType::kRetransmission);
++    rtx_fec_packet->set_fec_protect_packet(false);
++    packets.emplace_back(std::move(rtx_fec_packet));
++  }
++ 
++
++  paced_sender_->EnqueuePackets(std::move(packets));
++}
++
+ int32_t RTPSender::ReSendPacket(uint16_t packet_id) {
+   int32_t packet_size = 0;
+   const bool rtx = (RtxStatus() & kRtxRetransmitted) > 0;
+ 
++  std::vector<std::unique_ptr<RtpPacketToSend>> packets;  
++  auto now = clock_->TimeInMilliseconds();
++  RTC_LOG(LS_INFO) << "ResendPacket: " << packet_id << 
++                      ", time now: " << now;
++
++  max_sent_seq_num_ = std::max((int)packet_id, max_sent_seq_num_);
++  if (max_sent_seq_num_ - rtx_fec_base_num_ > 80) {
++    rtx_fec_base_num_ = max_sent_seq_num_ - 30;
++    wnd_rtx_fec_cnt_ = 0;
++  }
++
++  int fec_cnt = 0;
++
+   std::unique_ptr<RtpPacketToSend> packet =
+       packet_history_->GetPacketAndMarkAsPending(
+           packet_id, [&](const RtpPacketToSend& stored_packet) {
+@@ -292,6 +340,23 @@ int32_t RTPSender::ReSendPacket(uint16_t packet_id) {
+               retransmit_packet->set_retransmitted_sequence_number(
+                   stored_packet.SequenceNumber());
+             }
++            if (stored_packet.is_red()) {
++                RtpPacketToSend unpacked_packet(stored_packet);
++                const rtc::CopyOnWriteBuffer buffer = stored_packet.Buffer();
++                // Grab media payload type from RED header.
++                const size_t headers_size = stored_packet.headers_size();
++                unpacked_packet.SetPayloadType(buffer[headers_size]);
++
++                // Copy the media payload into the unpacked buffer.
++                uint8_t* payload_buffer =
++                    unpacked_packet.SetPayloadSize(stored_packet.payload_size() - 1);
++                std::copy(&stored_packet.payload()[0] + 1,
++                            &stored_packet.payload()[0] + stored_packet.payload_size(), payload_buffer);
++                fec_cnt = rtx_fec_generator_->RtxAddPacketAndGenerateFec(unpacked_packet);
++                
++            } else {
++                fec_cnt = rtx_fec_generator_->RtxAddPacketAndGenerateFec(stored_packet);
++            }  
+             return retransmit_packet;
+           });
+   if (packet_size == 0) {
+@@ -306,8 +371,29 @@ int32_t RTPSender::ReSendPacket(uint16_t packet_id) {
+   }
+   packet->set_packet_type(RtpPacketMediaType::kRetransmission);
+   packet->set_fec_protect_packet(false);
+-  std::vector<std::unique_ptr<RtpPacketToSend>> packets;
+   packets.emplace_back(std::move(packet));
++
++  auto fec_packets = rtx_fec_generator_->GetRtxFecPackets(rtx_fec_base_num_ - wnd_rtx_fec_cnt_);
++  wnd_rtx_fec_cnt_ += fec_cnt;
++  auto dup_packets = rtx_fec_generator_->GetDupPackets();
++
++  for (int i = 0; i < (int)dup_packets.size(); i++) {
++    std::unique_ptr<RtpPacketToSend> rtx_dup_packet = BuildRtxPacket(*dup_packets[i]);
++    rtx_dup_packet->set_retransmitted_sequence_number((*dup_packets[i]).SequenceNumber());
++    rtx_dup_packet->set_packet_type(RtpPacketMediaType::kRetransmission);
++    rtx_dup_packet->set_fec_protect_packet(false);
++    packets.emplace_back(std::move(rtx_dup_packet));
++    RTC_LOG(LS_INFO) << "send dup pkt: " << (*dup_packets[i]).SequenceNumber();
++  }
++
++  for (int i = 0; i < (int)fec_packets.size(); i++) {
++    std::unique_ptr<RtpPacketToSend> rtx_fec_packet = BuildRtxPacket(*fec_packets[i]);
++    rtx_fec_packet->set_retransmitted_sequence_number((*fec_packets[i]).SequenceNumber());
++    rtx_fec_packet->set_packet_type(RtpPacketMediaType::kRetransmission);
++    rtx_fec_packet->set_fec_protect_packet(false);
++    packets.emplace_back(std::move(rtx_fec_packet));
++  }
++
+   paced_sender_->EnqueuePackets(std::move(packets));
+ 
+   return packet_size;
+diff --git a/modules/rtp_rtcp/source/rtp_sender.h b/modules/rtp_rtcp/source/rtp_sender.h
+index a398f16d46..50e6f75ca6 100644
+--- a/modules/rtp_rtcp/source/rtp_sender.h
++++ b/modules/rtp_rtcp/source/rtp_sender.h
+@@ -32,6 +32,8 @@
+ #include "rtc_base/random.h"
+ #include "rtc_base/synchronization/mutex.h"
+ #include "rtc_base/thread_annotations.h"
++#include "rtc_base/task_utils/repeating_task.h"
++
+ 
+ namespace webrtc {
+ 
+@@ -42,6 +44,7 @@ class RtpPacketToSend;
+ 
+ // Maximum amount of padding in RFC 3550 is 255 bytes.
+ constexpr size_t kMaxPaddingLength = 255;
++constexpr TimeDelta kUpdateInterval = TimeDelta::Millis(2);
+ 
+ class RTPSender {
+  public:
+@@ -158,6 +161,9 @@ class RTPSender {
+  private:
+   std::unique_ptr<RtpPacketToSend> BuildRtxPacket(
+       const RtpPacketToSend& packet);
++  
++  void RegisterPeriodicModule();
++  void ProcessPeriodicTask();
+ 
+   bool IsFecPacket(const RtpPacketToSend& packet) const;
+ 
+@@ -177,6 +183,12 @@ class RTPSender {
+ 
+   RtpPacketHistory* const packet_history_;
+   RtpPacketSender* const paced_sender_;
++  VideoFecGenerator* const rtx_fec_generator_;
++  int rtx_fec_base_num_ = 0;
++  int wnd_rtx_fec_cnt_ = 0;
++  int max_sent_seq_num_ = 0;
++  RepeatingTaskHandle repeating_task_;
++
+ 
+   mutable Mutex send_mutex_;
+ 
+diff --git a/modules/rtp_rtcp/source/rtp_sender_egress.cc b/modules/rtp_rtcp/source/rtp_sender_egress.cc
+index 7fcea096ec..ff0e9a814a 100644
+--- a/modules/rtp_rtcp/source/rtp_sender_egress.cc
++++ b/modules/rtp_rtcp/source/rtp_sender_egress.cc
+@@ -94,6 +94,7 @@ RtpSenderEgress::RtpSenderEgress(const RtpRtcpInterface::Configuration& config,
+       is_audio_(config.audio),
+       need_rtp_packet_infos_(config.need_rtp_packet_infos),
+       fec_generator_(config.fec_generator),
++      rtx_fec_generator_(config.rtx_fec_generator),
+       transport_feedback_observer_(config.transport_feedback_callback),
+       send_packet_observer_(config.send_packet_observer),
+       rtp_stats_callback_(config.rtp_stats_callback),
+@@ -171,6 +172,8 @@ void RtpSenderEgress::SendPacket(std::unique_ptr<RtpPacketToSend> packet,
+     if (new_fec_params) {
+       fec_generator_->SetProtectionParameters(new_fec_params->first,
+                                               new_fec_params->second);
++      rtx_fec_generator_->SetProtectionParameters(new_fec_params->first,
++                                              new_fec_params->second);
+     }
+     if (packet->is_red()) {
+       RtpPacketToSend unpacked_packet(*packet);
+diff --git a/modules/rtp_rtcp/source/rtp_sender_egress.h b/modules/rtp_rtcp/source/rtp_sender_egress.h
+index 42f3c96ff0..d5ff995dc5 100644
+--- a/modules/rtp_rtcp/source/rtp_sender_egress.h
++++ b/modules/rtp_rtcp/source/rtp_sender_egress.h
+@@ -143,6 +143,7 @@ class RtpSenderEgress {
+   const bool is_audio_;
+   const bool need_rtp_packet_infos_;
+   VideoFecGenerator* const fec_generator_ RTC_GUARDED_BY(worker_queue_);
++  VideoFecGenerator* const rtx_fec_generator_ RTC_GUARDED_BY(worker_queue_);
+   absl::optional<uint16_t> last_sent_seq_ RTC_GUARDED_BY(worker_queue_);
+   absl::optional<uint16_t> last_sent_rtx_seq_ RTC_GUARDED_BY(worker_queue_);
+ 
+diff --git a/modules/rtp_rtcp/source/ulpfec_generator.cc b/modules/rtp_rtcp/source/ulpfec_generator.cc
+index cae659cdd7..9f4d0c0a61 100644
+--- a/modules/rtp_rtcp/source/ulpfec_generator.cc
++++ b/modules/rtp_rtcp/source/ulpfec_generator.cc
+@@ -15,12 +15,14 @@
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
++#include <fstream>
+ 
+ #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
+ #include "modules/rtp_rtcp/source/byte_io.h"
+ #include "modules/rtp_rtcp/source/forward_error_correction.h"
+ #include "modules/rtp_rtcp/source/forward_error_correction_internal.h"
+ #include "rtc_base/checks.h"
++#include "rtc_base/logging.h"
+ #include "rtc_base/synchronization/mutex.h"
+ 
+ namespace webrtc {
+@@ -60,6 +62,13 @@ constexpr float kMinMediaPacketsAdaptationThreshold = 2.0f;
+ // ForwardErrorCorrection in two objects -- one encoder and one decoder.
+ constexpr uint32_t kUnknownSsrc = 0;
+ 
++constexpr int DelayThreshold = 4;
++
++// need to measure, currentlly fixed.
++constexpr int DispersionTime = 15;
++
++constexpr int Deadline = 140;
++
+ }  // namespace
+ 
+ UlpfecGenerator::Params::Params() = default;
+@@ -77,7 +86,9 @@ UlpfecGenerator::UlpfecGenerator(int red_payload_type,
+       num_protected_frames_(0),
+       min_num_media_packets_(1),
+       media_contains_keyframe_(false),
+-      fec_bitrate_(/*max_window_size=*/TimeDelta::Seconds(1)) {}
++      fec_bitrate_(/*max_window_size=*/TimeDelta::Seconds(1)) {
++        SetRtxFecRateTable();
++      }
+ 
+ // Used by FlexFecSender, payload types are unused.
+ UlpfecGenerator::UlpfecGenerator(std::unique_ptr<ForwardErrorCorrection> fec,
+@@ -143,9 +154,10 @@ void UlpfecGenerator::AddPacketAndGenerateFec(const RtpPacketToSend& packet) {
+   if (complete_frame) {
+     ++num_protected_frames_;
+   }
+-
+   auto params = CurrentParams();
+ 
++  pkts_capture_time_.push_back(packet.capture_time().ms_or(0));
++
+   // Produce FEC over at most `params_.max_fec_frames` frames, or as soon as:
+   // (1) the excess overhead (actual overhead - requested/target overhead) is
+   // less than `kMaxExcessOverhead`, and
+@@ -156,15 +168,274 @@ void UlpfecGenerator::AddPacketAndGenerateFec(const RtpPacketToSend& packet) {
+     // We are not using Unequal Protection feature of the parity erasure code.
+     constexpr int kNumImportantPackets = 0;
+     constexpr bool kUseUnequalProtection = false;
++
++    auto now = clock_->CurrentTime().ms_or(0);
++    int min_remaining_time = 99999;
++
++    for (auto t: pkts_capture_time_) {
++        auto remaining_time = Deadline - (now - t);
++        if (remaining_time < min_remaining_time) {
++            min_remaining_time = remaining_time;
++        }
++    }
++
++    if (min_remaining_time < 0) {
++        min_remaining_time = 0;
++    }
++
++    int fec_cnt = GetFecCnt(double(params.loss/256.0), media_packets_.size(), min_remaining_time, params.rtt_ms, media_packets_.size());
++
++    if (fec_cnt > int(media_packets_.size())) {
++        fec_cnt = media_packets_.size();
++    }
++
++    RTC_LOG(LS_INFO) << "param loss: " << double(params.loss/256.0) << ", rtt: " << params.rtt_ms 
++                    << ",remaining time: " << min_remaining_time
++                    << ", pkt count: " << media_packets_.size()
++                    << ", fec cnt: " << fec_cnt;
++    
+     fec_->EncodeFec(media_packets_, params.fec_rate, kNumImportantPackets,
+                     kUseUnequalProtection, params.fec_mask_type,
+-                    &generated_fec_packets_);
++                    &generated_fec_packets_, fec_cnt);
++    pkts_capture_time_.clear();
+     if (generated_fec_packets_.empty()) {
+       ResetState();
+     }
+   }
+ }
+ 
++uint8_t UlpfecGenerator::GetFecCnt (double_t loss, uint8_t frameSize, uint16_t remainingTime, uint16_t rtt, uint8_t packet) {
++        // loss_index = round((loss - start) / interval)
++    if (start_loss_param_fix) {
++        if (loss < 0.005) {
++            loss = 0.005;
++        }
++    }
++
++    loss = (loss < 0.00) ? 0.00 : ((loss > 0.50) ? 0.50 : loss);
++    uint8_t loss_index = (uint8_t) round((loss - 0.00) / 0.01);
++
++    // frame_size_index = ceil((frame_size - start) / interval)
++    frameSize = (frameSize < 5) ? 5 : ((frameSize > 55) ? 55 : frameSize);
++    uint8_t frame_size_index = (uint8_t) ceil(((double_t) frameSize - 5) / 5);
++
++    // compute the remaining layer
++    if (rtt == 0) {
++        rtt = 20;
++    }
++    uint8_t layer = (uint8_t) (remainingTime / rtt);
++    layer = (layer < 1) ? 1 : ((layer > 15) ? 15 : layer);
++    uint8_t layer_index = (uint8_t) round(((double_t) layer - 1) / 1);
++
++
++    // packet_index = round((packet - start) / interval)
++    packet = (packet < 1) ? 1 : ((packet > 55) ? 55 : packet);
++    uint8_t packet_index = (uint8_t) round(((double_t) packet - 1) / 1);
++
++    /* array index */
++    uint64_t index =
++        loss_index * 9075
++        + frame_size_index * 825
++        + layer_index * 55
++        + packet_index;
++
++    /* assignment */
++    return m_betaArray[index];
++}
++
++void UlpfecGenerator::SetRtxFecRateTable() {
++    std::ifstream betaIo ("./fec_rate_table.bin");
++    if (betaIo.fail ()) {
++        RTC_LOG(LS_INFO) << "open file fail";
++    }
++    else {
++        betaIo.seekg (0, std::ios::beg);
++        betaIo.read ((char *) m_betaArray, sizeof (uint8_t) * 462825);
++        betaIo.close ();
++        RTC_LOG(LS_INFO) << "load fec rate success";
++    }
++}
++
++
++void UlpfecGenerator::RtxAddPacketToList(std::unique_ptr<RtpPacketToSend> raw_packet) {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++
++    auto fec_packet = std::make_unique<ForwardErrorCorrection::Packet>();
++    fec_packet->data = raw_packet->Buffer();
++
++    bool add_to_exist_group = false;
++    auto capture_time = raw_packet->capture_time().ms_or(0);
++    auto received_time = clock_->TimeInMilliseconds();
++    auto seq_num = raw_packet->SequenceNumber();
++    auto new_packet_info = RtxPacketInfo{capture_time, received_time, seq_num, std::move(fec_packet), std::move(raw_packet)};
++
++    for (auto it0 = rtx_media_packets_.begin(); it0 != rtx_media_packets_.end(); it0++) {
++        if (capture_time == it0->front().capture_time) {
++            auto it = std::lower_bound(it0->begin(), it0->end(), new_packet_info, CompareBySeqNum());
++            add_to_exist_group = true;
++            if (!(it != it0->end() && (*it).seq_num == seq_num)) {
++                it0->insert(it, std::move(new_packet_info));
++            }
++        }
++    }
++    if (!add_to_exist_group) {
++        rtx_media_packets_.push_back(std::list<RtxPacketInfo>());
++        rtx_media_packets_.back().push_back(RtxPacketInfo{capture_time, received_time, 0, nullptr, nullptr});
++        rtx_media_packets_.back().push_back(std::move(new_packet_info));
++    }
++}
++
++void UlpfecGenerator::FormPacketList(std::vector<std::list<RtxPacketInfo>>::iterator pkt_group) {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++    int64_t now = clock_->CurrentTime().ms_or(0);
++    rtx_packet_list_.clear();
++    rtx_raw_packet_list_.clear();
++    if (pkt_group->size() > 1) {
++        for (auto it = std::next(pkt_group->begin(),1) ; it != pkt_group->end();it++) {
++            int64_t remaining_time = Deadline - (now - it->capture_time);
++            rtx_packet_list_.push_back(std::make_unique<ForwardErrorCorrection::Packet>(*(it->packet)));
++            rtx_raw_packet_list_.push_back(std::make_unique<RtpPacketToSend>(*(it->raw_packet)));
++            remaining_time_ = std::max(remaining_time, (int64_t)0);
++        }
++    }
++}
++
++
++int UlpfecGenerator::ProcessPeriodicTask() {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++    RTC_DCHECK(generated_fec_packets_.empty());
++
++    int total_fec_cnt = 0;
++
++    auto params = CurrentParams();
++
++    
++    int64_t now = clock_->CurrentTime().ms_or(0);
++    for (auto it = rtx_media_packets_.begin(); it != rtx_media_packets_.end();){
++        for (auto it1 = it->begin(); it1 != it->end(); it1++) {
++            RTC_LOG(LS_INFO) << "seq num: " << it1->seq_num << ", capture time: " << it1->capture_time;
++        }
++        int64_t received_time;
++        if (it->size() > 1) {
++            received_time = std::next(it->begin(),1)->received_time;
++        } else {
++            received_time = now + 1;
++        }
++        auto round_elapsed_time = now - it->front().received_time;
++        RTC_LOG(LS_INFO) << "received time: " << now - received_time << ", round elapsed time: " << round_elapsed_time << ",time now: " << now;
++        if (now - received_time > DelayThreshold || round_elapsed_time > DispersionTime) {
++            auto fec_cnt = SendRtxFecGroup(it);
++            total_fec_cnt += fec_cnt;
++            if (round_elapsed_time > params.rtt_ms) {
++                RTC_LOG(LS_INFO) << "trigger dispersion time";
++                it = rtx_media_packets_.erase(it);
++            } else {
++                if (it->size() > 1) {
++                    it->erase(std::next(it->begin(),1), it->end());
++                }
++                it++;
++            }
++        } else {
++            it++;
++        }
++    }
++
++    return total_fec_cnt;
++}
++
++void UlpfecGenerator::GenerateDupPackets(int dup_cnt) {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++
++    int pkts_count = rtx_raw_packet_list_.size();
++    int dup_times = dup_cnt / pkts_count;
++    
++    for (auto it = rtx_raw_packet_list_.begin(); it != rtx_raw_packet_list_.end(); it++) {
++        for (int i = 0; i < dup_times; i++) {
++            auto packet = std::make_unique<RtpPacketToSend>(**it);
++            generated_dup_packets_.push_back(std::move(packet));
++        }
++    }
++}
++
++int UlpfecGenerator::SendRtxFecGroup(std::vector<std::list<RtxPacketInfo>>::iterator pkt_group) {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++
++    constexpr int kNumImportantPackets = 0;
++    constexpr bool kUseUnequalProtection = false;
++    auto params = CurrentParams();
++    
++    FormPacketList(pkt_group);
++        
++    int pkts_count = rtx_packet_list_.size();
++
++    int fec_cnt = 0;
++
++    if (pkts_count > 0) {
++        fec_cnt = GetFecCnt(double(params.loss/256.0), pkts_count, remaining_time_, params.rtt_ms, pkts_count);
++
++        RTC_LOG(LS_INFO) << "rtx param loss: " << double(params.loss/256.0) << ", rtt: " << params.rtt_ms 
++                << ", remaining time: " << remaining_time_
++                << ", pkt count: " << pkts_count
++                << ", fec cnt: " << fec_cnt;
++
++        if (fec_cnt > pkts_count) {
++            GenerateDupPackets(fec_cnt - pkts_count);
++            fec_cnt = pkts_count;
++        }
++
++        if (fec_cnt > 0) {
++            for (auto it = rtx_packet_list_.begin(); it != rtx_packet_list_.end();it++) {
++                RTC_LOG(LS_INFO) << "rtx fec protected pkt: " <<  ForwardErrorCorrection::ParseSequenceNumber((*it)->data.data());
++            }
++            fec_->EncodeFec(rtx_packet_list_, params.fec_rate, kNumImportantPackets,
++                kUseUnequalProtection, params.fec_mask_type,
++                &generated_fec_packets_, fec_cnt);
++        }
++
++    }
++  
++    return fec_cnt;
++}
++
++
++int UlpfecGenerator::RtxAddPacketAndGenerateFec(const RtpPacketToSend& packet) {
++  RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++  RTC_DCHECK(generated_fec_packets_.empty());
++
++  RTC_LOG(LS_INFO) << "RtxAddPacketAndGenerateFec: " << packet.SequenceNumber();
++                  
++  {
++    MutexLock lock(&mutex_);
++    if (pending_params_) {
++      current_params_ = *pending_params_;
++      pending_params_.reset();
++
++      if (CurrentParams().fec_rate > kHighProtectionThreshold) {
++        min_num_media_packets_ = kMinMediaPackets;
++      } else {
++        min_num_media_packets_ = 1;
++      }
++    }
++  }
++  
++    int64_t now = clock_->CurrentTime().ms_or(0);
++    if (last_loss_time - now < 50) {
++      start_loss_param_fix = true;
++    }
++    last_loss_time = now;
++
++
++    RtxAddPacketToList(std::make_unique<RtpPacketToSend>(packet));
++    
++    // Keep a copy of the last RTP packet, so we can copy the RTP header
++    // from it when creating newly generated ULPFEC+RED packets.
++    RTC_DCHECK_GE(packet.headers_size(), kRtpHeaderSize);
++    last_media_packet_ = packet;
++
++    int total_fec_cnt = 0;
++    return total_fec_cnt;
++}
++
+ bool UlpfecGenerator::ExcessOverheadBelowMax() const {
+   RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
+ 
+@@ -196,6 +467,16 @@ size_t UlpfecGenerator::MaxPacketOverhead() const {
+   return fec_->MaxPacketOverhead();
+ }
+ 
++std::vector<std::unique_ptr<RtpPacketToSend>> UlpfecGenerator::GetDupPackets() {
++    RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++    std::vector<std::unique_ptr<RtpPacketToSend>> dup_packets;
++    for(auto it = generated_dup_packets_.begin(); it != generated_dup_packets_.end(); it++) {
++        dup_packets.push_back(std::move(*it));
++    }
++    generated_dup_packets_.clear();
++    return dup_packets;
++}
++
+ std::vector<std::unique_ptr<RtpPacketToSend>> UlpfecGenerator::GetFecPackets() {
+   RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
+   if (generated_fec_packets_.empty()) {
+@@ -240,6 +521,52 @@ std::vector<std::unique_ptr<RtpPacketToSend>> UlpfecGenerator::GetFecPackets() {
+   return fec_packets;
+ }
+ 
++std::vector<std::unique_ptr<RtpPacketToSend>> UlpfecGenerator::GetRtxFecPackets(int fec_seq_num) {
++  RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++  if (generated_fec_packets_.empty()) {
++    return std::vector<std::unique_ptr<RtpPacketToSend>>();
++  }
++
++  // Wrap FEC packet (including FEC headers) in a RED packet. Since the
++  // FEC packets in `generated_fec_packets_` don't have RTP headers, we
++  // reuse the header from the last media packet.
++  RTC_CHECK(last_media_packet_.has_value());
++  last_media_packet_->SetPayloadSize(0);
++
++  std::vector<std::unique_ptr<RtpPacketToSend>> fec_packets;
++  fec_packets.reserve(generated_fec_packets_.size());
++
++  size_t total_fec_size_bytes = 0;
++  for (const auto* fec_packet : generated_fec_packets_) {
++    std::unique_ptr<RtpPacketToSend> red_packet =
++        std::make_unique<RtpPacketToSend>(*last_media_packet_);
++    red_packet->SetSequenceNumber(fec_seq_num);
++    fec_seq_num--;
++    red_packet->SetPayloadType(red_payload_type_);
++    red_packet->SetMarker(false);
++    uint8_t* payload_buffer = red_packet->SetPayloadSize(
++        kRedForFecHeaderLength + fec_packet->data.size());
++    // Primary RED header with F bit unset.
++    // See https://tools.ietf.org/html/rfc2198#section-3
++    payload_buffer[0] = ulpfec_payload_type_;  // RED header.
++    memcpy(&payload_buffer[1], fec_packet->data.data(),
++           fec_packet->data.size());
++    total_fec_size_bytes += red_packet->size();
++    red_packet->set_packet_type(RtpPacketMediaType::kForwardErrorCorrection);
++    red_packet->set_allow_retransmission(false);
++    red_packet->set_is_red(true);
++    red_packet->set_fec_protect_packet(false);
++    fec_packets.push_back(std::move(red_packet));
++  }
++
++  RtxResetState();
++
++  MutexLock lock(&mutex_);
++  fec_bitrate_.Update(total_fec_size_bytes, clock_->CurrentTime());
++
++  return fec_packets;
++}
++
+ DataRate UlpfecGenerator::CurrentFecRate() const {
+   MutexLock lock(&mutex_);
+   return fec_bitrate_.Rate(clock_->CurrentTime()).value_or(DataRate::Zero());
+@@ -264,4 +591,12 @@ void UlpfecGenerator::ResetState() {
+   media_contains_keyframe_ = false;
+ }
+ 
++void UlpfecGenerator::RtxResetState() {
++  RTC_DCHECK_RUNS_SERIALIZED(&race_checker_);
++  media_packets_.clear();
++  generated_fec_packets_.clear();
++  num_protected_frames_ = 0;
++  media_contains_keyframe_ = false;
++}
++
+ }  // namespace webrtc
+diff --git a/modules/rtp_rtcp/source/ulpfec_generator.h b/modules/rtp_rtcp/source/ulpfec_generator.h
+index 0058847357..8d7c0b27e6 100644
+--- a/modules/rtp_rtcp/source/ulpfec_generator.h
++++ b/modules/rtp_rtcp/source/ulpfec_generator.h
+@@ -32,6 +32,15 @@ class FlexfecSender;
+ class UlpfecGenerator : public VideoFecGenerator {
+   friend class FlexfecSender;
+ 
++  struct RtxPacketInfo
++  {
++    int64_t capture_time;
++    int64_t received_time;
++    uint16_t seq_num;
++    std::unique_ptr<ForwardErrorCorrection::Packet> packet;
++    std::unique_ptr<RtpPacketToSend> raw_packet;
++  };
++
+  public:
+   UlpfecGenerator(int red_payload_type, int ulpfec_payload_type, Clock* clock);
+   ~UlpfecGenerator();
+@@ -44,15 +53,43 @@ class UlpfecGenerator : public VideoFecGenerator {
+   void SetProtectionParameters(const FecProtectionParams& delta_params,
+                                const FecProtectionParams& key_params) override;
+ 
++  void SetRtxFecRateTable();
++
++  uint8_t GetFecCnt (double_t loss, uint8_t frameSize, uint16_t remainingTime, uint16_t rtt, uint8_t packet);
++
++  void GenerateDupPackets(int dup_cnt);
++
+   // Adds a media packet to the internal buffer. When enough media packets
+   // have been added, the FEC packets are generated and stored internally.
+   // These FEC packets are then obtained by calling GetFecPacketsAsRed().
+   void AddPacketAndGenerateFec(const RtpPacketToSend& packet) override;
+ 
++  int RtxAddPacketAndGenerateFec(const RtpPacketToSend& packet) override;
++
++  void RtxAddPacketToList(std::unique_ptr<RtpPacketToSend> raw_packet);
++
++  struct CompareBySeqNum
++  {
++    bool operator()(const RtxPacketInfo& a, const RtxPacketInfo& b) const {
++        return a.seq_num < b.seq_num;
++    }
++  };
++
++
++  void FormPacketList(std::vector<std::list<RtxPacketInfo>>::iterator pkt_group);
++
++  int SendRtxFecGroup(std::vector<std::list<RtxPacketInfo>>::iterator pkt_group);
++
++  int ProcessPeriodicTask() override;
++
+   // Returns the overhead, per packet, for FEC (and possibly RED).
+   size_t MaxPacketOverhead() const override;
+ 
++  std::vector<std::unique_ptr<RtpPacketToSend>> GetRtxFecPackets(int fec_seq_num) override;
++
+   std::vector<std::unique_ptr<RtpPacketToSend>> GetFecPackets() override;
++  std::vector<std::unique_ptr<RtpPacketToSend>> GetDupPackets() override;
++
+ 
+   // Current rate of FEC packets generated, including all RTP-level headers.
+   DataRate CurrentFecRate() const override;
+@@ -95,17 +132,26 @@ class UlpfecGenerator : public VideoFecGenerator {
+ 
+   void ResetState();
+ 
++  void RtxResetState();
++
+   const int red_payload_type_;
+   const int ulpfec_payload_type_;
+   Clock* const clock_;
+-
+   rtc::RaceChecker race_checker_;
+   const std::unique_ptr<ForwardErrorCorrection> fec_
+       RTC_GUARDED_BY(race_checker_);
+   ForwardErrorCorrection::PacketList media_packets_
+       RTC_GUARDED_BY(race_checker_);
++  ForwardErrorCorrection::PacketList rtx_packet_list_
++      RTC_GUARDED_BY(race_checker_);
++  std::vector<std::list<RtxPacketInfo>> rtx_media_packets_
++      RTC_GUARDED_BY(race_checker_);
+   absl::optional<RtpPacketToSend> last_media_packet_
+       RTC_GUARDED_BY(race_checker_);
++  std::list<std::unique_ptr<RtpPacketToSend>> rtx_raw_packet_list_
++      RTC_GUARDED_BY(race_checker_);
++  std::list<std::unique_ptr<RtpPacketToSend>> generated_dup_packets_
++      RTC_GUARDED_BY(race_checker_);
+   std::list<ForwardErrorCorrection::Packet*> generated_fec_packets_
+       RTC_GUARDED_BY(race_checker_);
+   int num_protected_frames_ RTC_GUARDED_BY(race_checker_);
+@@ -116,6 +162,13 @@ class UlpfecGenerator : public VideoFecGenerator {
+   mutable Mutex mutex_;
+   absl::optional<Params> pending_params_ RTC_GUARDED_BY(mutex_);
+   BitrateTracker fec_bitrate_ RTC_GUARDED_BY(mutex_);
++  uint8_t m_betaArray [462825];
++  std::list<int64_t> pkts_capture_time_;
++  int64_t remaining_time_;
++  int64_t last_loss_time = 0;
++  bool start_loss_param_fix = false;
++
++  
+ };
+ 
+ }  // namespace webrtc
+diff --git a/modules/rtp_rtcp/source/ulpfec_receiver.cc b/modules/rtp_rtcp/source/ulpfec_receiver.cc
+index 7f74a18a87..d31e295107 100644
+--- a/modules/rtp_rtcp/source/ulpfec_receiver.cc
++++ b/modules/rtp_rtcp/source/ulpfec_receiver.cc
+@@ -213,7 +213,7 @@ void UlpfecReceiver::ProcessReceivedFec() {
+       rtp_packet.ZeroMutableExtensions();
+       packet->data = rtp_packet.Buffer();
+     }
+-    if (!received_packet->is_recovered) {
++    if (received_packet->is_fec || !received_packet->is_recovered) {
+       // Do not pass recovered packets to FEC. Recovered packet might have
+       // different set of the RTP header extensions and thus different byte
+       // representation than the original packet, That will corrupt
+diff --git a/modules/rtp_rtcp/source/ulpfec_receiver_unittest.cc b/modules/rtp_rtcp/source/ulpfec_receiver_unittest.cc
+index 676e20c795..b7a03f03aa 100644
+--- a/modules/rtp_rtcp/source/ulpfec_receiver_unittest.cc
++++ b/modules/rtp_rtcp/source/ulpfec_receiver_unittest.cc
+@@ -106,7 +106,7 @@ void UlpfecReceiverTest::EncodeFec(
+   constexpr FecMaskType kFecMaskType = kFecMaskBursty;
+   EXPECT_EQ(
+       0, fec_->EncodeFec(media_packets, protection_factor, kNumImportantPackets,
+-                         kUseUnequalProtection, kFecMaskType, fec_packets));
++                         kUseUnequalProtection, kFecMaskType, fec_packets, -1));
+   ASSERT_EQ(num_fec_packets, fec_packets->size());
+ }
+ 
+@@ -371,7 +371,7 @@ TEST_F(UlpfecReceiverTest, TooManyFrames) {
+   std::list<ForwardErrorCorrection::Packet*> fec_packets;
+   EXPECT_EQ(-1, fec_->EncodeFec(media_packets,
+                                 kNumFecPackets * 255 / kNumMediaPackets, 0,
+-                                false, kFecMaskBursty, &fec_packets));
++                                false, kFecMaskBursty, &fec_packets, -1));
+ }
+ 
+ TEST_F(UlpfecReceiverTest, PacketNotDroppedTooEarly) {
+diff --git a/modules/rtp_rtcp/source/video_fec_generator.h b/modules/rtp_rtcp/source/video_fec_generator.h
+index 38e4103cb6..1b7a35f7c0 100644
+--- a/modules/rtp_rtcp/source/video_fec_generator.h
++++ b/modules/rtp_rtcp/source/video_fec_generator.h
+@@ -41,10 +41,15 @@ class VideoFecGenerator {
+   // to generate FEC packets at this time, if so they will be stored in an
+   // internal buffer.
+   virtual void AddPacketAndGenerateFec(const RtpPacketToSend& packet) = 0;
++  virtual int RtxAddPacketAndGenerateFec(const RtpPacketToSend& packet) = 0;
++  virtual int ProcessPeriodicTask() = 0;
+   // Get (and remove) and FEC packets pending in the generator. These packets
+   // will lack sequence numbers, that needs to be set externally.
+   // TODO(bugs.webrtc.org/11340): Actually FlexFec sets seq#, fix that!
+   virtual std::vector<std::unique_ptr<RtpPacketToSend>> GetFecPackets() = 0;
++  virtual std::vector<std::unique_ptr<RtpPacketToSend>> GetDupPackets() = 0;
++  virtual std::vector<std::unique_ptr<RtpPacketToSend>> GetRtxFecPackets(int fec_seq_num) = 0;
++
+   // Only called on the VideoSendStream queue, after operation has shut down,
+   // and only populated if there is an RtpState (e.g. FlexFec).
+   virtual absl::optional<RtpState> GetRtpState() = 0;
+diff --git a/modules/rtp_rtcp/test/testFec/test_fec.cc b/modules/rtp_rtcp/test/testFec/test_fec.cc
+index 5ac8feca21..0d91984906 100644
+--- a/modules/rtp_rtcp/test/testFec/test_fec.cc
++++ b/modules/rtp_rtcp/test/testFec/test_fec.cc
+@@ -289,7 +289,7 @@ void RunTest(bool use_flexfec) {
+ 
+             ASSERT_EQ(0, fec->EncodeFec(media_packet_list, protection_factor,
+                                         num_imp_packets, kUseUnequalProtection,
+-                                        fec_mask_type, &fec_packet_list))
++                                        fec_mask_type, &fec_packet_list, -1))
+                 << "EncodeFec() failed";
+ 
+             ASSERT_EQ(num_fec_packets, fec_packet_list.size())
+diff --git a/modules/video_coding/fec_controller_default.cc b/modules/video_coding/fec_controller_default.cc
+index f204b01c7c..eec0a403b3 100644
+--- a/modules/video_coding/fec_controller_default.cc
++++ b/modules/video_coding/fec_controller_default.cc
+@@ -126,6 +126,10 @@ uint32_t FecControllerDefault::UpdateFecRates(
+     // Get the FEC code rate for Delta frames (set to 0 when NA).
+     delta_fec_params.fec_rate =
+         loss_prot_logic_->SelectedMethod()->RequiredProtectionFactorD();
++    key_fec_params.loss = packet_loss_enc;
++    key_fec_params.rtt_ms = round_trip_time_ms;
++    delta_fec_params.loss = packet_loss_enc;
++    delta_fec_params.rtt_ms = round_trip_time_ms;
+     // The RTP module currently requires the same `max_fec_frames` for both
+     // key and delta frames.
+     delta_fec_params.max_fec_frames =
+diff --git a/modules/video_coding/nack_requester.h b/modules/video_coding/nack_requester.h
+index c860787dcf..3d4c32c2ec 100644
+--- a/modules/video_coding/nack_requester.h
++++ b/modules/video_coding/nack_requester.h
+@@ -40,7 +40,7 @@ class NackRequesterBase {
+ 
+ class NackPeriodicProcessor {
+  public:
+-  static constexpr TimeDelta kUpdateInterval = TimeDelta::Millis(20);
++  static constexpr TimeDelta kUpdateInterval = TimeDelta::Millis(5);
+   explicit NackPeriodicProcessor(TimeDelta update_interval = kUpdateInterval);
+   ~NackPeriodicProcessor();
+   void RegisterNackModule(NackRequesterBase* module);
+diff --git a/modules/video_coding/timing/timing.cc b/modules/video_coding/timing/timing.cc
+index 735f6328d8..f37007bf75 100644
+--- a/modules/video_coding/timing/timing.cc
++++ b/modules/video_coding/timing/timing.cc
+@@ -204,10 +204,22 @@ Timestamp VCMTiming::RenderTimeInternal(uint32_t frame_timestamp,
+   Timestamp estimated_complete_time =
+       ts_extrapolator_->ExtrapolateLocalTime(frame_timestamp).value_or(now);
+ 
++  uint32_t timestamp_now = 90 * (uint32_t) now.ms_or(0);
++  uint32_t delta = (timestamp_now - frame_timestamp) / 90;
++
+   // Make sure the actual delay stays in the range of `min_playout_delay_`
+   // and `max_playout_delay_`.
+   TimeDelta actual_delay =
+       current_delay_.Clamped(min_playout_delay_, max_playout_delay_);
++
++  total_count_ += 1;
++  if (delta > 150) {
++    miss_count_ += 1;
++  }
++
++  RTC_LOG(LS_INFO) << "frame timestamp: " << frame_timestamp
++                   << ", timestamp now: " << timestamp_now << ", delta: " << delta
++                   << ", total count: " << total_count_ << " , miss count: " << miss_count_; 
+   return estimated_complete_time + actual_delay;
+ }
+ 
+diff --git a/modules/video_coding/timing/timing.h b/modules/video_coding/timing/timing.h
+index 9e7fb874c7..8836e71f72 100644
+--- a/modules/video_coding/timing/timing.h
++++ b/modules/video_coding/timing/timing.h
+@@ -53,6 +53,9 @@ class VCMTiming {
+     TimeDelta current_delay;
+   };
+ 
++  int mutable total_count_ = 0;
++  int mutable miss_count_ = 0;
++
+   static constexpr TimeDelta kDefaultRenderDelay = TimeDelta::Millis(10);
+   static constexpr int kDelayMaxChangeMsPerS = 100;
+ 
+diff --git a/rtc_base/bitrate_tracker.cc b/rtc_base/bitrate_tracker.cc
+index 340e444f24..cd31fca477 100644
+--- a/rtc_base/bitrate_tracker.cc
++++ b/rtc_base/bitrate_tracker.cc
+@@ -27,6 +27,10 @@ absl::optional<DataRate> BitrateTracker::Rate(Timestamp now) const {
+   return absl::nullopt;
+ }
+ 
++int BitrateTracker::GetAccumutaledCount() {
++   return impl_.GetAccumulatedCount();
++}
++
+ bool BitrateTracker::SetWindowSize(TimeDelta window_size, Timestamp now) {
+   return impl_.SetWindowSize(window_size.ms(), now.ms());
+ }
+diff --git a/rtc_base/bitrate_tracker.h b/rtc_base/bitrate_tracker.h
+index a54bd9a561..fdfbc17e4d 100644
+--- a/rtc_base/bitrate_tracker.h
++++ b/rtc_base/bitrate_tracker.h
+@@ -52,6 +52,8 @@ class RTC_EXPORT BitrateTracker {
+   // Returns nullopt when bitrate can't be measured.
+   absl::optional<DataRate> Rate(Timestamp now) const;
+ 
++  int GetAccumutaledCount();
++
+   // Update the size of the averaging window. The maximum allowed value for
+   // `window_size` is `max_window_size` as supplied in the constructor.
+   bool SetWindowSize(TimeDelta window_size, Timestamp now);
+diff --git a/rtc_base/rate_statistics.cc b/rtc_base/rate_statistics.cc
+index 5c83796471..df3ab4e19e 100644
+--- a/rtc_base/rate_statistics.cc
++++ b/rtc_base/rate_statistics.cc
+@@ -25,6 +25,7 @@ RateStatistics::Bucket::Bucket(int64_t timestamp)
+ 
+ RateStatistics::RateStatistics(int64_t window_size_ms, float scale)
+     : accumulated_count_(0),
++      total_accumulated_count_(0),
+       first_timestamp_(-1),
+       num_samples_(0),
+       scale_(scale),
+@@ -34,6 +35,7 @@ RateStatistics::RateStatistics(int64_t window_size_ms, float scale)
+ RateStatistics::RateStatistics(const RateStatistics& other)
+     : buckets_(other.buckets_),
+       accumulated_count_(other.accumulated_count_),
++      total_accumulated_count_(other.total_accumulated_count_),
+       first_timestamp_(other.first_timestamp_),
+       overflow_(other.overflow_),
+       num_samples_(other.num_samples_),
+@@ -47,6 +49,7 @@ RateStatistics::~RateStatistics() {}
+ 
+ void RateStatistics::Reset() {
+   accumulated_count_ = 0;
++  total_accumulated_count_ = 0;
+   overflow_ = false;
+   num_samples_ = 0;
+   first_timestamp_ = -1;
+@@ -78,12 +81,17 @@ void RateStatistics::Update(int64_t count, int64_t now_ms) {
+ 
+   if (std::numeric_limits<int64_t>::max() - accumulated_count_ > count) {
+     accumulated_count_ += count;
++    total_accumulated_count_ += count;
+   } else {
+     overflow_ = true;
+   }
+   ++num_samples_;
+ }
+ 
++int RateStatistics::GetAccumulatedCount(){
++  return total_accumulated_count_;
++}
++
+ absl::optional<int64_t> RateStatistics::Rate(int64_t now_ms) const {
+   // Yeah, this const_cast ain't pretty, but the alternative is to declare most
+   // of the members as mutable...
+diff --git a/rtc_base/rate_statistics.h b/rtc_base/rate_statistics.h
+index e7ce8ad5ed..ec29231183 100644
+--- a/rtc_base/rate_statistics.h
++++ b/rtc_base/rate_statistics.h
+@@ -68,6 +68,8 @@ class RTC_EXPORT RateStatistics {
+   // window_size_ms is max_window_size_ms as supplied in the constructor.
+   bool SetWindowSize(int64_t window_size_ms, int64_t now_ms);
+ 
++  int GetAccumulatedCount();
++
+  private:
+   void EraseOld(int64_t now_ms);
+ 
+@@ -83,6 +85,8 @@ class RTC_EXPORT RateStatistics {
+   // Total count recorded in all buckets.
+   int64_t accumulated_count_;
+ 
++  int64_t total_accumulated_count_;
++
+   // Timestamp of the first data point seen, or -1 of none seen.
+   int64_t first_timestamp_;
+ 
+diff --git a/video/rtp_video_stream_receiver2.cc b/video/rtp_video_stream_receiver2.cc
+index 9a38097a93..7aba2d1b6e 100644
+--- a/video/rtp_video_stream_receiver2.cc
++++ b/video/rtp_video_stream_receiver2.cc
+@@ -1111,7 +1111,9 @@ void RtpVideoStreamReceiver2::ParseAndHandleEncapsulatingHeader(
+   if (packet.payload()[0] == ulpfec_receiver_->ulpfec_payload_type()) {
+     // Notify video_receiver about received FEC packets to avoid NACKing these
+     // packets.
+-    NotifyReceiverOfEmptyPacket(packet.SequenceNumber());
++    if (!packet.recovered()) {
++        NotifyReceiverOfEmptyPacket(packet.SequenceNumber());
++    } 
+   }
+   if (ulpfec_receiver_->AddReceivedRedPacket(packet)) {
+     ulpfec_receiver_->ProcessReceivedFec();
+-- 
+2.41.0.windows.1
+
