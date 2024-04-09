@@ -21,14 +21,14 @@ cd src/
 git checkout -b my_branch refs/remotes/branch-heads/6045
 ```
 
-### Step 3: Apply the patch
+### Step 4: Apply the patch
 Make sure that you are at the `src` directory of the WebRTC repository.
 ```
 git apply ../hairpin-webrtc/hairpin.patch
 ```
 Reminder: you can add the `--stat` option to see the changes, and `--check` option to do a dry run to detect errors beforehand.
 
-### Step 4: Copy the weights of Hairpin
+### Step 5: Copy the weights of Hairpin
 Copy the weights of Hairpin (`fec_rate_table.bin`) to the `src` directory of the WebRTC repository.
 ```
 cp ../hairpin-webrtc/fec_rate_table.bin .
