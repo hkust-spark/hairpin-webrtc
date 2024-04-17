@@ -1,5 +1,5 @@
 # The WebRTC Implementation of Hairpin (NSDI 2024)
-Welcome! Besides the simulation codes in [](), we provide a WebRTC-compatible implementation of Hairpin based on the M119 release of WebRTC.
+Welcome! Besides the simulation codes in [hairpin](https://github.com/hkust-spark/hairpin), we provide a WebRTC-compatible implementation of Hairpin based on the M119 release of WebRTC.
 This is a preliminary implementation and not fully tested yet.
 We are working on a more stable version but please do let us know if you encounter any issues.
 
