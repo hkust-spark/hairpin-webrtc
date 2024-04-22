@@ -35,4 +35,4 @@ cp ../hairpin-webrtc/fec_rate_table.bin .
 ```
 
 ## Questions
-If you have any questions, please feel free to contact us at [Zili Meng](mailto:zilim@ust.hk) and [Yan Zhang](zh-yan20@mails.tsinghua.edu.cn).
+If you have any questions, please feel free to contact us at [Zili Meng](mailto:zilim@ust.hk) and [Yan Zhang](mailto:zh-yan20@mails.tsinghua.edu.cn).
